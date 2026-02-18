@@ -11,6 +11,7 @@ package vault
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -254,4 +255,153 @@ func (v *Vault) decrypt(ciphertext, nonce []byte) ([]byte, error) {
 		return nil, err
 	}
 	return plaintext, nil
+}
+
+// SearchableStore encrypts content with a deterministic nonce derived from
+// HMAC-SHA256(key, plaintext). This allows equality search on encrypted data:
+// the same plaintext always produces the same ciphertext.
+func (v *Vault) SearchableStore(content []byte) (*Object, error) {
+	if int64(len(content)) > v.config.MaxObjectSize {
+		return nil, fmt.Errorf("content exceeds max size: %d > %d", len(content), v.config.MaxObjectSize)
+	}
+
+	hash := sha256.Sum256(content)
+	hashStr := hex.EncodeToString(hash[:])
+
+	v.mu.RLock()
+	if obj, exists := v.objects[hashStr]; exists {
+		v.mu.RUnlock()
+		return obj, nil
+	}
+	v.mu.RUnlock()
+
+	// Deterministic nonce via HMAC-SHA256(key, content)
+	encrypted, nonce, err := v.encryptDeterministic(content)
+	if err != nil {
+		return nil, fmt.Errorf("searchable encryption failed: %w", err)
+	}
+
+	obj := &Object{
+		Hash:      hashStr,
+		Size:      int64(len(content)),
+		Mode:      ModeSearchable,
+		Encrypted: encrypted,
+		Nonce:     nonce,
+	}
+
+	v.mu.Lock()
+	v.objects[hashStr] = obj
+	v.mu.Unlock()
+
+	return obj, nil
+}
+
+// Verify proves that the vault holds content matching the given hash
+// by decrypting and re-hashing, then comparing. Returns true if verified.
+func (v *Vault) Verify(hashStr string) (bool, error) {
+	content, err := v.Retrieve(hashStr)
+	if err != nil {
+		return false, err
+	}
+
+	computed := sha256.Sum256(content)
+	computedStr := hex.EncodeToString(computed[:])
+	return computedStr == hashStr, nil
+}
+
+// Load reads vault objects from disk back into memory.
+// Complement to Persist().
+func (v *Vault) Load() error {
+	dir := v.config.StorePath
+	objDir := filepath.Join(dir, "objects")
+
+	prefixes, err := os.ReadDir(objDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No vault on disk yet
+		}
+		return fmt.Errorf("read objects dir: %w", err)
+	}
+
+	block, err := aes.NewCipher(v.key)
+	if err != nil {
+		return fmt.Errorf("create cipher: %w", err)
+	}
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("create GCM: %w", err)
+	}
+	nonceSize := aesGCM.NonceSize()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	for _, prefix := range prefixes {
+		if !prefix.IsDir() {
+			continue
+		}
+		prefixPath := filepath.Join(objDir, prefix.Name())
+		entries, err := os.ReadDir(prefixPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			hashStr := prefix.Name() + entry.Name()
+			data, err := os.ReadFile(filepath.Join(prefixPath, entry.Name()))
+			if err != nil {
+				continue
+			}
+			if len(data) < nonceSize {
+				continue
+			}
+			nonce := data[:nonceSize]
+			encrypted := data[nonceSize:]
+
+			// Verify we can decrypt
+			plaintext, err := aesGCM.Open(nil, nonce, encrypted, nil)
+			if err != nil {
+				continue // Skip corrupted objects
+			}
+
+			v.objects[hashStr] = &Object{
+				Hash:      hashStr,
+				Size:      int64(len(plaintext)),
+				Mode:      v.config.EncryptionMode,
+				Encrypted: encrypted,
+				Nonce:     nonce,
+			}
+		}
+	}
+
+	return nil
+}
+
+// encryptDeterministic uses HMAC-SHA256 of the key+content as nonce,
+// enabling equality search on ciphertexts.
+func (v *Vault) encryptDeterministic(plaintext []byte) ([]byte, []byte, error) {
+	block, err := aes.NewCipher(v.key)
+	if err != nil {
+		return nil, nil, err
+	}
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Derive deterministic nonce from HMAC-SHA256(key, plaintext)
+	mac := hmacSHA256(v.key, plaintext)
+	nonce := mac[:aesGCM.NonceSize()]
+
+	ciphertext := aesGCM.Seal(nil, nonce, plaintext, nil)
+	return ciphertext, nonce, nil
+}
+
+// hmacSHA256 computes HMAC-SHA256
+func hmacSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }
