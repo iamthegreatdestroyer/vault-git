@@ -9,17 +9,22 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // EncryptionMode specifies the vault encryption strategy
@@ -182,6 +187,17 @@ func (v *Vault) Exists(hash string) bool {
 	return exists
 }
 
+// List returns all objects in the vault.
+func (v *Vault) List() []*Object {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	out := make([]*Object, 0, len(v.objects))
+	for _, obj := range v.objects {
+		out = append(out, obj)
+	}
+	return out
+}
+
 // Stats returns vault statistics
 func (v *Vault) Stats() VaultStats {
 	v.mu.RLock()
@@ -199,7 +215,7 @@ func (v *Vault) Stats() VaultStats {
 	}
 }
 
-// Persist writes the vault to disk
+// Persist writes the vault to disk using the VaultContainer binary format.
 func (v *Vault) Persist() error {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -216,7 +232,10 @@ func (v *Vault) Persist() error {
 			return err
 		}
 		path := filepath.Join(objDir, hash[2:])
-		data := append(obj.Nonce, obj.Encrypted...)
+		data, err := v.marshalContainer(obj)
+		if err != nil {
+			return fmt.Errorf("marshal container %s: %w", hash, err)
+		}
 		if err := os.WriteFile(path, data, 0600); err != nil {
 			return err
 		}
@@ -309,7 +328,7 @@ func (v *Vault) Verify(hashStr string) (bool, error) {
 	return computedStr == hashStr, nil
 }
 
-// Load reads vault objects from disk back into memory.
+// Load reads VaultContainer objects from disk back into memory.
 // Complement to Persist().
 func (v *Vault) Load() error {
 	dir := v.config.StorePath
@@ -323,6 +342,7 @@ func (v *Vault) Load() error {
 		return fmt.Errorf("read objects dir: %w", err)
 	}
 
+	// Build GCM once to get nonce size for size validation before decryption.
 	block, err := aes.NewCipher(v.key)
 	if err != nil {
 		return fmt.Errorf("create cipher: %w", err)
@@ -331,7 +351,6 @@ func (v *Vault) Load() error {
 	if err != nil {
 		return fmt.Errorf("create GCM: %w", err)
 	}
-	nonceSize := aesGCM.NonceSize()
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -354,25 +373,21 @@ func (v *Vault) Load() error {
 			if err != nil {
 				continue
 			}
-			if len(data) < nonceSize {
+
+			obj, err := v.unmarshalContainer(data)
+			if err != nil {
+				continue // Skip tampered or corrupted objects
+			}
+
+			// Verify decryptability and determine plaintext size.
+			plaintext, err := aesGCM.Open(nil, obj.Nonce, obj.Encrypted, nil)
+			if err != nil {
 				continue
 			}
-			nonce := data[:nonceSize]
-			encrypted := data[nonceSize:]
 
-			// Verify we can decrypt
-			plaintext, err := aesGCM.Open(nil, nonce, encrypted, nil)
-			if err != nil {
-				continue // Skip corrupted objects
-			}
-
-			v.objects[hashStr] = &Object{
-				Hash:      hashStr,
-				Size:      int64(len(plaintext)),
-				Mode:      v.config.EncryptionMode,
-				Encrypted: encrypted,
-				Nonce:     nonce,
-			}
+			obj.Hash = hashStr
+			obj.Size = int64(len(plaintext))
+			v.objects[hashStr] = obj
 		}
 	}
 
@@ -404,4 +419,100 @@ func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write(data)
 	return h.Sum(nil)
+}
+
+// ── VaultContainer binary format ────────────────────────────────────────────
+//
+// Layout:
+//   [4]  magic bytes: 0x56 0x4C 0x54 0x01  ("VLT\x01")
+//   [4]  header length (big-endian uint32)
+//   [N]  JSON header
+//   [12] nonce
+//   [M]  ciphertext
+//   [32] HMAC-SHA256(key, magic+headerLen+header+nonce+ciphertext)
+
+var containerMagic = [4]byte{0x56, 0x4C, 0x54, 0x01}
+
+type containerHeader struct {
+	Hash      string `json:"hash"`
+	Mode      string `json:"mode"`
+	Version   int    `json:"version"`
+	CreatedAt string `json:"created_at"`
+}
+
+// marshalContainer serialises obj into the VaultContainer binary format.
+func (v *Vault) marshalContainer(obj *Object) ([]byte, error) {
+	hdr := containerHeader{
+		Hash:      obj.Hash,
+		Mode:      obj.Mode.String(),
+		Version:   1,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	hdrJSON, err := json.Marshal(hdr)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	buf.Write(containerMagic[:])
+
+	hdrLen := make([]byte, 4)
+	binary.BigEndian.PutUint32(hdrLen, uint32(len(hdrJSON)))
+	buf.Write(hdrLen)
+	buf.Write(hdrJSON)
+	buf.Write(obj.Nonce)
+	buf.Write(obj.Encrypted)
+
+	payload := buf.Bytes()
+	mac := hmacSHA256(v.key, payload)
+	buf.Write(mac)
+
+	return buf.Bytes(), nil
+}
+
+// unmarshalContainer parses a VaultContainer byte slice and verifies HMAC.
+func (v *Vault) unmarshalContainer(data []byte) (*Object, error) {
+	const minSize = 4 + 4 + 1 + 12 + 32 // magic+hdrLen+minHdr+nonce+mac
+	if len(data) < minSize {
+		return nil, errors.New("container too small")
+	}
+
+	if [4]byte(data[:4]) != containerMagic {
+		return nil, errors.New("bad magic bytes")
+	}
+
+	hdrLen := binary.BigEndian.Uint32(data[4:8])
+	if int(hdrLen) > len(data)-8-32 {
+		return nil, errors.New("header length overflow")
+	}
+
+	hdrEnd := 8 + int(hdrLen)
+	hdrJSON := data[8:hdrEnd]
+
+	// HMAC covers everything except the trailing 32-byte mac
+	payload := data[:len(data)-32]
+	mac := data[len(data)-32:]
+	expected := hmacSHA256(v.key, payload)
+	if !hmac.Equal(mac, expected) {
+		return nil, errors.New("HMAC verification failed: container tampered")
+	}
+
+	var hdr containerHeader
+	if err := json.Unmarshal(hdrJSON, &hdr); err != nil {
+		return nil, fmt.Errorf("parse header: %w", err)
+	}
+
+	body := data[hdrEnd : len(data)-32]
+	if len(body) < 12 {
+		return nil, errors.New("body too small for nonce")
+	}
+	nonce := body[:12]
+	encrypted := body[12:]
+
+	return &Object{
+		Hash:      hdr.Hash,
+		Mode:      v.config.EncryptionMode,
+		Nonce:     nonce,
+		Encrypted: encrypted,
+	}, nil
 }

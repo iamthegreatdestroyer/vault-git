@@ -2,6 +2,8 @@ package vault
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -129,4 +131,120 @@ func TestConcurrentAccess(t *testing.T) {
 
 	stats := v.Stats()
 	assert.Equal(t, 10, stats.TotalObjects)
+}
+
+// TestContainerRoundTrip verifies that marshalContainer → unmarshalContainer
+// preserves the object and that Persist/Load round-trips correctly.
+func TestContainerRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.StorePath = filepath.Join(dir, ".vault")
+	v, err := New(cfg, []byte("container-roundtrip-key-0000000"))
+	require.NoError(t, err)
+
+	content := []byte("container round-trip test content")
+	obj, err := v.Store(content)
+	require.NoError(t, err)
+
+	raw, err := v.marshalContainer(obj)
+	require.NoError(t, err)
+
+	got, err := v.unmarshalContainer(raw)
+	require.NoError(t, err)
+	assert.Equal(t, obj.Hash, got.Hash)
+	assert.Equal(t, obj.Nonce, got.Nonce)
+	assert.Equal(t, obj.Encrypted, got.Encrypted)
+
+	// Full Persist → Load round-trip
+	require.NoError(t, v.Persist())
+
+	v2, err := New(cfg, []byte("container-roundtrip-key-0000000"))
+	require.NoError(t, err)
+	require.NoError(t, v2.Load())
+
+	restored, err := v2.Retrieve(obj.Hash)
+	require.NoError(t, err)
+	assert.Equal(t, content, restored)
+}
+
+// TestContainerTampering verifies that any bit-flip in the container body
+// is detected by the HMAC check.
+func TestContainerTampering(t *testing.T) {
+	t.Parallel()
+
+	v, err := New(DefaultConfig(), []byte("tamper-test-key-000000000000000"))
+	require.NoError(t, err)
+
+	obj, err := v.Store([]byte("tamper me"))
+	require.NoError(t, err)
+
+	raw, err := v.marshalContainer(obj)
+	require.NoError(t, err)
+
+	// Flip one byte in the middle of the payload (skip magic+hdrLen = 8 bytes)
+	tampered := make([]byte, len(raw))
+	copy(tampered, raw)
+	tampered[len(tampered)/2] ^= 0xFF
+
+	_, err = v.unmarshalContainer(tampered)
+	assert.Error(t, err, "expected HMAC failure on tampered container")
+}
+
+// TestGitHookWorkflow simulates the pre-commit + post-checkout lifecycle:
+//  1. Encrypt a "sensitive" file and write a .vault pointer (pre-commit analog).
+//  2. Remove the plaintext; restore it from the pointer (post-checkout analog).
+//  3. Assert restored content equals original.
+func TestGitHookWorkflow(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.StorePath = filepath.Join(dir, ".vault")
+	v, err := New(cfg, []byte("hook-workflow-test-key-000000"))
+	require.NoError(t, err)
+
+	// ── pre-commit: encrypt a secrets file ──────────────────────────────────
+	secretContent := []byte("DATABASE_URL=postgres://user:p@ssw0rd@host/db")
+	secretFile := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(secretFile, secretContent, 0600))
+
+	data, err := os.ReadFile(secretFile)
+	require.NoError(t, err)
+
+	obj, err := v.Store(data)
+	require.NoError(t, err)
+
+	// Write pointer file (what the pre-commit hook does)
+	vaultPointer := secretFile + ".vault"
+	require.NoError(t, os.WriteFile(vaultPointer, []byte(obj.Hash), 0600))
+
+	// Unstage plaintext (simulate git rm --cached)
+	require.NoError(t, os.Remove(secretFile))
+	assert.NoFileExists(t, secretFile)
+
+	// Persist vault to disk
+	require.NoError(t, v.Persist())
+
+	// ── post-checkout: decrypt from pointer ─────────────────────────────────
+	// Simulate fresh vault load (new process)
+	v2, err := New(cfg, []byte("hook-workflow-test-key-000000"))
+	require.NoError(t, err)
+	require.NoError(t, v2.Load())
+
+	hash, err := os.ReadFile(vaultPointer)
+	require.NoError(t, err)
+
+	restored, err := v2.Retrieve(string(hash))
+	require.NoError(t, err)
+
+	// Write restored plaintext and remove pointer
+	require.NoError(t, os.WriteFile(secretFile, restored, 0600))
+	require.NoError(t, os.Remove(vaultPointer))
+
+	// Assert content matches original
+	got, err := os.ReadFile(secretFile)
+	require.NoError(t, err)
+	assert.Equal(t, secretContent, got)
 }

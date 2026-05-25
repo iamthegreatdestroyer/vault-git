@@ -1,0 +1,10 @@
+# compiled binaries
+vault-git
+vault-git.exe
+vault-git-*
+
+# local vault store (runtime data, not source)
+.vault/
+
+# escrow file (contains encrypted keys)
+*.escrow.yaml
