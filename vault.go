@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
 
 // EncryptionMode specifies the vault encryption strategy
@@ -103,12 +105,13 @@ func New(config VaultConfig, masterKey []byte) (*Vault, error) {
 	if len(masterKey) < 16 {
 		return nil, fmt.Errorf("master key must be at least 16 bytes")
 	}
-	// Derive AES-256 key from master key
-	hash := sha256.Sum256(masterKey)
+	// Derive AES-256 key from master key using Argon2id
+	salt := []byte("vault-git-v1-key-derivation")
+	derivedKey := argon2.IDKey(masterKey, salt, 1, 64*1024, 4, 32)
 	return &Vault{
 		config:  config,
 		objects: make(map[string]*Object),
-		key:     hash[:],
+		key:     derivedKey,
 	}, nil
 }
 
