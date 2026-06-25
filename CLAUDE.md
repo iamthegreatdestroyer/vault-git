@@ -120,12 +120,12 @@ git tag v0.3.0 && git push origin v0.3.0
 ```
 
 ## Done Criteria (all must pass)
-- [ ] `go test ./... -race` passes — zero failures
-- [ ] `vault-git store / retrieve / verify / list / stats` commands work
+- [x] `go test ./... -race` passes — zero failures
+- [x] `vault-git store / retrieve / verify / list / stats` commands work
 - [ ] Git pre-commit and post-checkout hooks install and work
-- [ ] VaultContainer binary format with HMAC integrity check
-- [ ] `KeyEscrow` interface with LocalEscrow + FileEscrow implementations
-- [ ] `go vet ./...` clean
+- [x] VaultContainer binary format with HMAC integrity check
+- [x] `KeyEscrow` interface with LocalEscrow + FileEscrow implementations
+- [x] `go vet ./...` clean
 - [ ] `v0.3.0` tag pushed
 
 ## Completion Signal
