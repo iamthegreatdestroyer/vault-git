@@ -9,6 +9,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/crypto/argon2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -82,9 +84,34 @@ func (e *LocalEscrow) Rotate(keyID string, _ []byte, newKey []byte) error {
 
 // ── FileEscrow ───────────────────────────────────────────────────────────────
 
+// Escrow KDF scheme identifier persisted per entry. This is the on-disk format
+// version; bump it if the KDF parameters or wrapping change in a way that makes
+// old entries unreadable.
+//
+// schemeArgon2idV1 wraps each entry with AES-256-GCM whose key is derived from
+// the master password via Argon2id (RFC 9106) over a per-entry random 16-byte
+// salt, using the parameters below.
+const schemeArgon2idV1 = "argon2id-v1"
+
+// Argon2id key-derivation parameters. Chosen for interactive escrow use.
+// keyLen is 32 bytes to produce an AES-256 key.
+const (
+	argonTime    uint32 = 1
+	argonMemory  uint32 = 64 * 1024 // 64 MiB
+	argonThreads uint8  = 4
+	argonKeyLen  uint32 = 32
+	argonSaltLen        = 16
+)
+
 // fileEscrowRecord is what gets persisted per key entry.
 type fileEscrowRecord struct {
-	// EncryptedKey is AES-GCM( masterKey-derived, encryptedKey payload )
+	// Scheme identifies the KDF/wrapping format used for this entry.
+	// An empty Scheme marks a legacy pre-Argon2id entry (unsalted
+	// SHA-256(masterPassword) key); such entries are rejected on read.
+	Scheme string `yaml:"scheme"`
+	// Salt is the per-entry random Argon2id salt, hex-encoded.
+	Salt string `yaml:"salt"`
+	// EncryptedKey is AES-256-GCM( Argon2id(masterPassword, Salt), payload )
 	// stored as hex.
 	EncryptedKey string `yaml:"encrypted_key"`
 	// Nonce used for the outer AES-GCM layer, hex.
@@ -97,23 +124,41 @@ type fileEscrowStore struct {
 }
 
 // FileEscrow is an on-disk escrow backend. Each key entry is wrapped with
-// AES-256-GCM keyed by SHA-256(masterPassword). The proof passed to
+// AES-256-GCM whose key is derived from the master password via Argon2id over a
+// per-entry random salt (see schemeArgon2idV1). The proof passed to
 // Retrieve/Rotate must equal SHA-256(masterPassword).
+//
+// SECURITY / BREAKING CHANGE: earlier versions derived the AES key from a
+// single UNSALTED SHA-256(masterPassword). That is intentionally no longer
+// supported. Entries written by that format carry no "scheme" field and are
+// rejected on Retrieve/Rotate with a clear error — the on-disk format has
+// changed and any pre-existing entries must be re-Deposited under the new
+// scheme. This is deliberate: an unsalted single-round hash offers no work
+// factor against a stolen escrow file, so silently accepting it would defeat
+// the point of this fix.
 type FileEscrow struct {
-	path     string
-	aesKey   []byte // sha256(masterPassword)
-	mu       sync.Mutex
+	path string
+	// masterPassword is retained to re-derive per-entry Argon2id keys from the
+	// stored salt. It is a private copy and must never be logged.
+	masterPassword []byte
+	// pwVerifier is SHA-256(masterPassword); the Retrieve/Rotate proof is
+	// checked against it in constant time. This preserves the historical proof
+	// contract (proof == SHA-256(masterPassword)) without exposing any key.
+	pwVerifier []byte
+	mu         sync.Mutex
 }
 
 // NewFileEscrow creates a FileEscrow backed by the given file path.
-// masterPassword is hashed with SHA-256 to derive the AES-256 key.
-// masterPassword must never be logged by callers.
+// masterPassword is used with Argon2id (per-entry salt) to derive each entry's
+// AES-256 key. masterPassword must never be logged by callers.
 func NewFileEscrow(path string, masterPassword []byte) (*FileEscrow, error) {
 	if len(masterPassword) == 0 {
 		return nil, errors.New("escrow: master password must not be empty")
 	}
-	h := sha256.Sum256(masterPassword)
-	return &FileEscrow{path: path, aesKey: h[:]}, nil
+	pw := make([]byte, len(masterPassword))
+	copy(pw, masterPassword)
+	verifier := sha256.Sum256(masterPassword)
+	return &FileEscrow{path: path, masterPassword: pw, pwVerifier: verifier[:]}, nil
 }
 
 func (e *FileEscrow) load() (*fileEscrowStore, error) {
@@ -142,34 +187,69 @@ func (e *FileEscrow) save(store *fileEscrowStore) error {
 	return os.WriteFile(e.path, data, 0600)
 }
 
-func (e *FileEscrow) wrap(plainKey []byte) (string, string, error) {
-	block, err := aes.NewCipher(e.aesKey)
+// deriveKey derives the per-entry AES-256 key from the master password and the
+// entry's salt using Argon2id.
+func (e *FileEscrow) deriveKey(salt []byte) []byte {
+	return argon2.IDKey(e.masterPassword, salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+}
+
+// wrap generates a fresh random salt, derives the entry key with Argon2id, and
+// AES-256-GCM-seals plainKey. It returns (scheme, saltHex, ciphertextHex,
+// nonceHex).
+func (e *FileEscrow) wrap(plainKey []byte) (scheme, saltHex, encHex, nonceHex string, err error) {
+	salt := make([]byte, argonSaltLen)
+	if _, err = io.ReadFull(rand.Reader, salt); err != nil {
+		return "", "", "", "", err
+	}
+	aesKey := e.deriveKey(salt)
+
+	block, err := aes.NewCipher(aesKey)
 	if err != nil {
-		return "", "", err
+		return "", "", "", "", err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return "", "", err
+		return "", "", "", "", err
 	}
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", "", err
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", "", "", "", err
 	}
 	ct := gcm.Seal(nil, nonce, plainKey, nil)
-	return hex.EncodeToString(ct), hex.EncodeToString(nonce), nil
+	return schemeArgon2idV1, hex.EncodeToString(salt), hex.EncodeToString(ct), hex.EncodeToString(nonce), nil
 }
 
-func (e *FileEscrow) unwrap(encHex, nonceHex string, proof []byte) ([]byte, error) {
-	// Verify proof == e.aesKey (caller passes sha256(masterPassword))
+// unwrap verifies the proof and the entry scheme, re-derives the entry key from
+// the stored salt via Argon2id, and AES-256-GCM-opens the ciphertext.
+func (e *FileEscrow) unwrap(scheme, saltHex, encHex, nonceHex string, proof []byte) ([]byte, error) {
+	// Reject legacy, unsalted entries. An empty scheme means the record predates
+	// the Argon2id format (unsalted SHA-256(masterPassword) key). This is an
+	// intentional breaking change: such entries cannot be read and must be
+	// re-Deposited.
+	if scheme == "" {
+		return nil, errors.New("escrow: legacy unsalted entry rejected; the on-disk format changed (Argon2id) and this key must be re-deposited")
+	}
+	if scheme != schemeArgon2idV1 {
+		return nil, fmt.Errorf("escrow: unsupported entry scheme %q", scheme)
+	}
+
+	// Verify proof == SHA-256(masterPassword) in constant time. This preserves
+	// the historical proof contract while no longer exposing a single derived
+	// AES key (the AES key is now per-entry).
 	if len(proof) != 32 {
 		return nil, errors.New("escrow: proof must be 32 bytes (SHA-256)")
 	}
-	proofHash := sha256.Sum256(proof)
-	keyHash := sha256.Sum256(e.aesKey)
-	if proofHash != keyHash {
+	if subtle.ConstantTimeCompare(proof, e.pwVerifier) != 1 {
 		return nil, errors.New("escrow: invalid proof")
 	}
 
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return nil, fmt.Errorf("escrow: decode salt: %w", err)
+	}
+	if len(salt) == 0 {
+		return nil, errors.New("escrow: entry missing salt")
+	}
 	ct, err := hex.DecodeString(encHex)
 	if err != nil {
 		return nil, fmt.Errorf("escrow: decode ciphertext: %w", err)
@@ -179,7 +259,8 @@ func (e *FileEscrow) unwrap(encHex, nonceHex string, proof []byte) ([]byte, erro
 		return nil, fmt.Errorf("escrow: decode nonce: %w", err)
 	}
 
-	block, err := aes.NewCipher(e.aesKey)
+	aesKey := e.deriveKey(salt)
+	block, err := aes.NewCipher(aesKey)
 	if err != nil {
 		return nil, err
 	}
@@ -202,11 +283,16 @@ func (e *FileEscrow) Deposit(keyID string, encryptedKey []byte) error {
 		return err
 	}
 
-	encHex, nonceHex, err := e.wrap(encryptedKey)
+	scheme, saltHex, encHex, nonceHex, err := e.wrap(encryptedKey)
 	if err != nil {
 		return fmt.Errorf("escrow: wrap key: %w", err)
 	}
-	store.Keys[keyID] = fileEscrowRecord{EncryptedKey: encHex, Nonce: nonceHex}
+	store.Keys[keyID] = fileEscrowRecord{
+		Scheme:       scheme,
+		Salt:         saltHex,
+		EncryptedKey: encHex,
+		Nonce:        nonceHex,
+	}
 	return e.save(store)
 }
 
@@ -222,7 +308,7 @@ func (e *FileEscrow) Retrieve(keyID string, proof []byte) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("escrow: key %q not found", keyID)
 	}
-	return e.unwrap(rec.EncryptedKey, rec.Nonce, proof)
+	return e.unwrap(rec.Scheme, rec.Salt, rec.EncryptedKey, rec.Nonce, proof)
 }
 
 func (e *FileEscrow) Rotate(keyID string, oldProof, newKey []byte) error {
@@ -237,16 +323,23 @@ func (e *FileEscrow) Rotate(keyID string, oldProof, newKey []byte) error {
 	if !ok {
 		return fmt.Errorf("escrow: key %q not found", keyID)
 	}
-	// Verify old proof before replacing
-	if _, err := e.unwrap(rec.EncryptedKey, rec.Nonce, oldProof); err != nil {
+	// Verify old proof (and that the existing entry is a supported scheme)
+	// before replacing.
+	if _, err := e.unwrap(rec.Scheme, rec.Salt, rec.EncryptedKey, rec.Nonce, oldProof); err != nil {
 		return fmt.Errorf("escrow: rotate auth failed: %w", err)
 	}
 
-	encHex, nonceHex, err := e.wrap(newKey)
+	// Re-wrap under a fresh salt.
+	scheme, saltHex, encHex, nonceHex, err := e.wrap(newKey)
 	if err != nil {
 		return fmt.Errorf("escrow: wrap new key: %w", err)
 	}
-	store.Keys[keyID] = fileEscrowRecord{EncryptedKey: encHex, Nonce: nonceHex}
+	store.Keys[keyID] = fileEscrowRecord{
+		Scheme:       scheme,
+		Salt:         saltHex,
+		EncryptedKey: encHex,
+		Nonce:        nonceHex,
+	}
 	return e.save(store)
 }
 
